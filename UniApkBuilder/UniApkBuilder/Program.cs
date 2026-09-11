@@ -290,24 +290,87 @@ namespace UniApkBuilder
             if (!success) return;
 
             // ---- 3) 下载最新 APK（从 Content-Disposition 读取服务端原始文件名）----
-            using var apkResp = await http.GetAsync($"{baseUrl}/api/download");
-            if (!apkResp.IsSuccessStatusCode)
-            {
-                Console.WriteLine($"[HTTP {(int)apkResp.StatusCode}] APK 下载失败");
-                return;
-            }
-            var apkBytes = await apkResp.Content.ReadAsByteArrayAsync();
+            Console.WriteLine("开始下载Apk...");
+            await DownloadApkAsync(http, baseUrl, outputPath);
+        }
 
-            // 优先取 filename*（RFC 5987，支持中文），退回 filename，最后退回本地指定路径
-            var disposition = apkResp.Content.Headers.ContentDisposition;
+        /// <summary>下载服务端最新 APK 到 outputPath，并实时输出下载进度</summary>
+        /// <returns>下载并保存成功返回 true</returns>
+        static async Task<bool> DownloadApkAsync(HttpClient http, string baseUrl, string outputPath)
+        {
+            // 必须用 ResponseHeadersRead：否则 HttpClient 会把整个 APK 缓冲完才返回，
+            // 既拿不到流式进度，也会在内存里多占一份 APK 大小
+            using var resp = await http.GetAsync($"{baseUrl}/api/download", HttpCompletionOption.ResponseHeadersRead);
+            if (!resp.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"[HTTP {(int)resp.StatusCode}] APK 下载失败");
+                return false;
+            }
+
+            // 优先取 filename*（RFC 5987，支持中文），退回 filename，最后退回本地兜底名
+            var disposition = resp.Content.Headers.ContentDisposition;
             var remoteName = disposition?.FileNameStar;
             if (string.IsNullOrWhiteSpace(remoteName))
                 remoteName = disposition?.FileName;
             remoteName = Path.GetFileName(remoteName?.Trim('"') ?? string.Empty); // 只取文件名，防路径穿越
+            if (string.IsNullOrWhiteSpace(remoteName))
+                remoteName = $"app-{DateTime.Now:yyMMddHHmmss}.apk";
+
             string savePath = Path.Combine(outputPath, remoteName);
 
-            await File.WriteAllBytesAsync(savePath, apkBytes);
-            Console.WriteLine($"APK 已保存: {savePath}（{apkBytes.Length / 1024.0 / 1024:F1} MB）");
+            long? total = resp.Content.Headers.ContentLength;   // 服务端未给长度时为 null
+            long received = 0;
+            long lastReportedBytes = 0;
+            int lastPercent = -1;
+            int lastLineLength = 0;
+
+            // 控制台支持 \r：在同一行原地刷新进度；
+            // 输出被重定向（写入日志文件 / UI 抓取）时 \r 无效，只能换行输出，否则日志里会堆满控制字符
+            bool inPlace = !Console.IsOutputRedirected;
+
+            void ReportProgress()
+            {
+                string text;
+                if (total is > 0)
+                {
+                    int percent = (int)(received * 100 / total.Value);
+                    if (percent == lastPercent) return;
+                    lastPercent = percent;
+                    text = $"下载中 {percent,3}% ({received / 1024.0 / 1024:F1}/{total.Value / 1024.0 / 1024:F1} MB)";
+                }
+                else
+                {
+                    if (received - lastReportedBytes < 1024 * 1024) return;   // 长度未知时每满 1MB 报一次
+                    lastReportedBytes = received;
+                    text = $"下载中 {received / 1024.0 / 1024:F1} MB";
+                }
+
+                if (!inPlace)
+                {
+                    Console.WriteLine(text);
+                    return;
+                }
+
+                // PadRight 补齐上一次的宽度，防止新内容比旧内容短时残留尾巴
+                Console.Write("\r" + text.PadRight(lastLineLength));
+                lastLineLength = text.Length;
+            }
+
+            await using var source = await resp.Content.ReadAsStreamAsync();
+            await using var target = File.Create(savePath);
+
+            byte[] buffer = new byte[81920];
+            int read;
+            while ((read = await source.ReadAsync(buffer)) > 0)
+            {
+                await target.WriteAsync(buffer.AsMemory(0, read));
+                received += read;
+                ReportProgress();
+            }
+
+            if (inPlace) Console.WriteLine();   // 进度行收尾，别让最终信息拼在进度后面
+            Console.WriteLine($"APK 已保存: {savePath}（{received / 1024.0 / 1024:F1} MB）");
+            return true;
         }
     }
 }
