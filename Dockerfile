@@ -63,6 +63,8 @@ RUN mkdir -p $GRADLE_DIST_DIR \
     && chmod 644 $GRADLE_DIST_DIR/*.zip
 
 
+COPY UniApkBuilder/UniApkBuilder/bin/publish/UniApkBuilder.exe /data/server/wwwroot/
+
 COPY server/ /data/server/
 WORKDIR /data/server
 EXPOSE 80

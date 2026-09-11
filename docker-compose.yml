@@ -6,6 +6,6 @@ services:
     restart: unless-stopped
     volumes:
       - ./uni-app-sdk:/data/uni-app-sdk:ro
-      - ./server:/data/server:ro
+      #- ./server:/data/server:ro # 调试的时候挂载
     ports:
       - "8020:80"
