@@ -1,0 +1,11 @@
+services:
+  server:
+    build: .
+    image: uni-apk-builder:latest
+    container_name: uni-apk-builder
+    restart: unless-stopped
+    volumes:
+      - ./uni-app-sdk:/data/uni-app-sdk:ro
+      - ./server:/data/server:ro
+    ports:
+      - "8020:80"

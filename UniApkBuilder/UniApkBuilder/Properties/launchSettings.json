@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "UniApkBuilder": {
+      "commandName": "Project",
+      "commandLineArgs": "--no-wait"
+    }
+  }
+}
