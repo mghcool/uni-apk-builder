@@ -2,6 +2,7 @@
 using System.IO.Compression;
 using System.Net.Http.Headers;
 using System.Net.ServerSentEvents;
+using System.Reflection;
 using System.Text;
 
 namespace UniApkBuilder
@@ -15,6 +16,10 @@ namespace UniApkBuilder
         {
             // 当使用vscode等终端调用时，可以加上这个参数不等待结束。
             bool shouldWait = !args.Contains("--no-wait");
+
+            Version version = Assembly.GetExecutingAssembly().GetName().Version!;
+
+            Console.WriteLine($"uni-app APK 打包工具，版本：v{version.ToString(3)}");
 
             ApkConfig config;
             try
