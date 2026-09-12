@@ -22,6 +22,25 @@ from .config import (WORK_DIR, ANDROID_SDK_DIR, OUTPUT_DIR, GRADLE_USER_HOME,
 from .utils import _human_size, _read_text, _sed_inplace, find_android_home
 
 
+class BuildCancelled(Exception):
+    """客户端断开后主动中止构建。
+
+    与"构建失败"区分开：这不是配置或编译错误，日志里不该按 [ERROR] 报。
+    """
+
+
+def _terminate_process(proc, timeout=10):
+    """结束子进程：先 SIGTERM，超时再 SIGKILL，并回收，避免留下僵尸"""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def _xml_escape(s):
     """转义 XML 文本/属性中的特殊字符（应用名、版本号来自用户 manifest.json）"""
     return (str(s).replace('&', '&amp;').replace('<', '&lt;')
@@ -46,8 +65,12 @@ def _as_int(v, default):
         return default
 
 
-def build_project(zip_dir, params, log):
-    """执行一次完整构建。构建失败的现场保留在 WORK_DIR 便于排查。"""
+def build_project(zip_dir, params, log, cancel=None):
+    """执行一次完整构建。构建失败的现场保留在 WORK_DIR 便于排查。
+
+    cancel 为 threading.Event（可选）：置位表示客户端已断开，
+    构建应在下一个检查点中止（抛 BuildCancelled）。
+    """
 
     def ok(msg):
         log('[OK] ' + msg)
@@ -58,9 +81,19 @@ def build_project(zip_dir, params, log):
     def err(msg):
         log('[ERROR] ' + msg)
 
+    def check_cancel():
+        """客户端断开后尽早退出，别把几分钟的 Gradle 编译白跑完。
+
+        只在重活之前检查：步骤 3~8 都是容器内文件复制（秒级），
+        真正耗时的只有步骤 9 的 Gradle，所以不逐步骤插桩。
+        """
+        if cancel is not None and cancel.is_set():
+            raise BuildCancelled('客户端已断开，中止构建')
+
     log('=' * 42)
     log(' uni-app Android 离线打包构建')
     log('=' * 42)
+    check_cancel()
 
     # 清空构建工作目录：删掉上一次构建的工程与产物，
     # 本次构建失败时现场干净、方便定位问题
@@ -472,6 +505,10 @@ def build_project(zip_dir, params, log):
     with open(os.path.join(android_project, 'local.properties'), 'w', encoding='utf-8') as f:
         f.write('sdk.dir=%s\n' % android_home)
 
+    # 前置检查：上面的 sdkmanager 安装可能耗时几分钟，若这期间客户端已断开，
+    # 就别再启动一次完整的 Gradle 编译
+    check_cancel()
+
     env2 = dict(os.environ, GRADLE_USER_HOME=GRADLE_USER_HOME, ANDROID_HOME=android_home)
     # 不加 --no-daemon：模板 gradle.properties 配置了 org.gradle.jvmargs，
     # --no-daemon 会触发 fork 单次 Daemon 并打印相关提示；用常驻 Daemon 则无此提示，
@@ -481,8 +518,24 @@ def build_project(zip_dir, params, log):
         cwd=android_project, env=env2,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding='utf-8', errors='replace', bufsize=1)
-    for line in proc.stdout:
-        log(line.rstrip('\n'))
+    # gradlew 的最后一步是 exec "$JAVACMD"，即 shell 被替换成 JVM 本身，
+    # 所以 proc 就是 Gradle 客户端进程，terminate() 能直接打到它，不会残留中间 shell
+    cancelled = False
+    try:
+        for line in proc.stdout:
+            log(line.rstrip('\n'))
+            if cancel is not None and cancel.is_set():
+                cancelled = True
+                break
+    finally:
+        if cancelled:
+            # 只 break 不结束进程会死锁：没人再读管道，Gradle 写满管道缓冲区后
+            # 会永久阻塞在写日志上，既跑不完也退不出
+            warn('客户端已断开，正在终止 Gradle 进程...')
+            _terminate_process(proc)
+        proc.stdout.close()
+    if cancelled:
+        raise BuildCancelled('客户端已断开，已终止 Gradle 构建')
     proc.wait()
     if proc.returncode != 0:
         err('Gradle 编译失败')

@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
 
 from .config import build_lock, WWWROOT, MAX_UPLOAD_BYTES
-from .build import build_project
+from .build import build_project, BuildCancelled
 from .utils import find_apk, extract_zip, _human_size
 
 
@@ -30,6 +30,8 @@ class Handler(BaseHTTPRequestHandler):
         # SSE 日志由主线程与心跳线程并发写入同一连接，必须串行化，
         # 否则两次写入可能交错，产生损坏的事件
         self._sse_lock = threading.Lock()
+        # 客户端是否已断开（由 SSE 写失败置位）。用于中止正在跑的构建
+        self._client_gone = False
 
     def log_message(self, fmt, *args):
         pass  # 关闭默认访问日志（构建日志已单独输出）
@@ -44,13 +46,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _write_sse(self, line):
-        """写一行 SSE 事件并立即刷新（主线程与心跳线程并发调用安全）"""
+        """写一行 SSE 事件并立即刷新（主线程与心跳线程并发调用安全）
+
+        写失败即判定客户端已断开：置位 _client_gone 并跳过后续写入，
+        上层据此中止构建，避免 Gradle 白跑几分钟
+        """
+        if self._client_gone:
+            return
         try:
             with self._sse_lock:
                 self.wfile.write(('data: ' + line + '\n\n').encode('utf-8'))
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # 客户端已断开，忽略
+        except OSError:
+            # 含 BrokenPipeError / ConnectionResetError / ConnectionAbortedError
+            self._client_gone = True
 
     def _content_length(self):
         """解析 Content-Length；缺失或非法按 0 处理"""
@@ -209,12 +218,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
+        # 取消事件：客户端断开时置位，传给 build_project 让它尽早终止 Gradle
+        cancel = threading.Event()
+
         # 日志同时输出到控制台（docker logs 排查用）与 SSE
         def log(line):
             print(line, flush=True)
-            self._write_sse(line)
+            self._write_sse(line)      # 写失败会置位 _client_gone
+            if self._client_gone:
+                cancel.set()
 
-        # 心跳：每 30 秒发一个空事件，防止客户端/代理超时断开
+        # 心跳：每 30 秒发一个空事件，防止客户端/代理超时断开。
+        # 它同时也是断连探针：客户端已走时这次写入会失败并置位 _client_gone，
+        # 从而使下一次 log() 立即置位 cancel
         heartbeat_stop = threading.Event()
 
         def heartbeat():
@@ -225,8 +241,11 @@ class Handler(BaseHTTPRequestHandler):
 
         log('[开始] 构建已启动...')
         try:
-            build_project(tmp_dir, params, log)
+            build_project(tmp_dir, params, log, cancel)
             log('=== 构建结束 (exit=0) ===')
+        except BuildCancelled as e:
+            # 客户端已断开，再发 SSE 没有意义，只留一行控制台日志
+            print('[INFO] 构建已中止: %s' % e, flush=True)
         except Exception as e:
             log('构建异常: ' + str(e))
             log('=== 构建结束 (exit=1) ===')
