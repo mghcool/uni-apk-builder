@@ -5,7 +5,7 @@ LABEL maintainer="mghcool"
 # --- 环境变量配置 ---
 ENV ANDROID_SDK_TOOLS_VERSION="15859902"
 ENV ANDROID_SDK_TOOLS_CHECKSUM="4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583"
-ENV ANDROID_HOME="/opt/android-sdk-linux"
+ENV ANDROID_HOME="/opt/android-sdk"
 ENV ANDROID_SDK_ROOT="$ANDROID_HOME"
 ENV PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools"
 ENV DEBIAN_FRONTEND=noninteractive
