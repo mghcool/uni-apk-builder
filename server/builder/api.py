@@ -17,9 +17,9 @@ import mimetypes
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
 
-from .config import build_lock, WWWROOT
+from .config import build_lock, WWWROOT, MAX_UPLOAD_BYTES
 from .build import build_project
-from .utils import find_apk, extract_zip
+from .utils import find_apk, extract_zip, _human_size
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -138,6 +138,18 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 构建接口 ----
     def _build(self):
+        # 上传体积上限：只看 Content-Length，在读取请求体、抢锁、解压之前就拒绝。
+        # 放在抢锁前是有意的——超限请求不该排在一个正在跑的构建后面等 409。
+        # 与 409 同理，必须先读完请求体再回响应（理由见 _discard_body）
+        length = self._content_length()
+        if length > MAX_UPLOAD_BYTES:
+            self._discard_body()
+            self._send_json(413, {
+                'error': '上传包过大：%s，上限 %s'
+                         % (_human_size(length), _human_size(MAX_UPLOAD_BYTES)),
+            })
+            return
+
         # 解析查询参数
         qs = parse_qs(urlparse(self.path).query)
 

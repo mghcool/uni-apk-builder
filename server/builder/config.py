@@ -15,6 +15,9 @@ WWWROOT = os.path.join(HERE, 'wwwroot')     # 静态说明页目录
 ANDROID_SDK_DIR = '/data/uni-app-sdk'       # uni-app 离线打包 SDK 根目录
 WORK_DIR = '/data/build'                    # 构建工作目录（串行构建，固定复用）
 OUTPUT_DIR = '/data/output'                 # APK 输出目录（只保留最新一个）
+# /api/build 上传 zip 的体积上限。按 Content-Length 提前拒绝，超限返回 413。
+# 100 MiB = 104857600 字节（与客户端进度显示一致，均按 1MiB=1024KiB 计算）
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 os.makedirs(WORK_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
