@@ -5,50 +5,40 @@
 #      该文件不在 git 里，必须在 CI 里现做；
 #   2. Native AOT 不支持跨 OS 编译，Windows 目标只能在 Windows 上发布；
 #      而 GitHub 的 Windows 运行器只能跑 Windows 容器，所以镜像构建放在 ubuntu。
-#
-# 产物：ghcr.io/mghcool/uni-apk-builder（tag 见 docker/metadata-action 一段）
 
 name: Build & Push Image
 
 on:
   push:
     tags: ['v*']          # 推 v1.1.0 这类 tag 时出正式版
-  workflow_dispatch:       # 也可手动跑（出 :edge tag，方便先试）
+  workflow_dispatch:      # 也可手动跑（出 :test tag）
 
 permissions:
   contents: read
-  packages: write          # 推 ghcr 必需，用内置 GITHUB_TOKEN 即可，无需额外 secret
+  packages: write
 
 concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
-  CACHE_REF: ghcr.io/${{ github.repository }}:buildcache
+  IMAGE: ghcr.io/${{ github.repository }}   # 镜像名：ghcr.io/<所有者>/<仓库名>
+  CACHE_REF: ghcr.io/${{ github.repository }}:buildcache  # 专门用来存放构建缓存，后续构建会快很多
 
 jobs:
-  # ---------- 1/2 出客户端 exe ----------
+  # ---------- 出客户端 exe ----------
   client:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4   # clone 代码到工作目录
 
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
-      # 与 build.bat 第一条命令一致（Release + win-x64 + AOT 都由 pubxml 决定）
       - name: dotnet publish (win-x64 AOT)
         run: dotnet publish UniApkBuilder/UniApkBuilder/UniApkBuilder.csproj -p:PublishProfile="Properties\PublishProfiles\FolderProfile.pubxml"
-
-      - name: 校验产物存在
-        shell: pwsh
-        run: |
-          $exe = 'UniApkBuilder\UniApkBuilder\bin\publish\UniApkBuilder.exe'
-          if (-not (Test-Path $exe)) { throw "AOT 发布未产出 $exe" }
-          Get-Item $exe | Select-Object FullName, Length
 
       - uses: actions/upload-artifact@v4
         with:
@@ -56,11 +46,11 @@ jobs:
           path: UniApkBuilder/UniApkBuilder/bin/publish/UniApkBuilder.exe
           if-no-files-found: error
 
-  # ---------- 2/2 构建 Linux 镜像并推送 ----------
+  # ---------- 构建 Linux 镜像并推送 ----------
   image:
     needs: client
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -84,23 +74,17 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
-            type=raw,value=latest
-            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=raw,value=test,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           push: true
-          # 关闭 provenance：默认会附加 attestation manifest，镜像变成 OCI index，
-          # 旧版 Docker pull 时可能解析到无 CMD 的 attestation 清单，报 no command specified。
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # 缓存走 registry 而不是 type=gha：镜像含 Android SDK，层体积远超
-          # GitHub Actions 缓存 10 GB/仓库 的上限，放 gha 会被反复驱逐。
           cache-from: type=registry,ref=${{ env.CACHE_REF }}
           cache-to: type=registry,ref=${{ env.CACHE_REF }},mode=max
 
