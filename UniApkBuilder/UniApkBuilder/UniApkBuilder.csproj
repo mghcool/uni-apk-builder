@@ -10,7 +10,7 @@
 	<ApplicationIcon>..\..\server\wwwroot\favicon.ico</ApplicationIcon>
 	<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
 	<Deterministic>false</Deterministic>
-	<Version>1.0.0</Version>
+	<Version>1.1.0</Version>
     <AssemblyVersion>$(Version).*</AssemblyVersion>
     <FileVersion>$(Version)</FileVersion>
   </PropertyGroup>
