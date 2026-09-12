@@ -86,7 +86,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest
             type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@v6
@@ -94,6 +94,9 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
+          # 关闭 provenance：默认会附加 attestation manifest，镜像变成 OCI index，
+          # 旧版 Docker pull 时可能解析到无 CMD 的 attestation 清单，报 no command specified。
+          provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # 缓存走 registry 而不是 type=gha：镜像含 Android SDK，层体积远超
