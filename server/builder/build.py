@@ -19,7 +19,8 @@ import shlex
 
 from .config import (WORK_DIR, ANDROID_SDK_DIR, OUTPUT_DIR, GRADLE_USER_HOME,
                      GRADLE_DIST_DIR, FORCE_16K_TOOLCHAIN, TOOLCHAIN_16K)
-from .utils import _human_size, _read_text, _sed_inplace, find_android_home
+from .utils import (_human_size, _read_text, _sed_inplace, _verify,
+                    TemplateMismatch, find_android_home)
 
 
 class BuildCancelled(Exception):
@@ -89,6 +90,18 @@ def build_project(zip_dir, params, log, cancel=None):
         """
         if cancel is not None and cancel.is_set():
             raise BuildCancelled('客户端已断开，中止构建')
+
+    def verify(tag, path, checks):
+        """回读刚改写的文件并断言期望内容已写入（说明见 utils._verify）。
+
+        锚点没命中就中断构建：模板结构与预期不符时编出来的是坏包，
+        不能让它伪装成"构建成功"。
+        """
+        try:
+            return _verify(tag, path, checks)
+        except TemplateMismatch as e:
+            err(str(e))
+            raise
 
     log('=' * 42)
     log(' uni-app Android 离线打包构建')
@@ -232,6 +245,13 @@ def build_project(zip_dir, params, log, cancel=None):
                                           % TOOLCHAIN_16K['build_tools'], 1)
             return re.sub(r'compileSdkVersion \d+', cs, content)
         _sed_inplace(demo_gradle, _force_toolchain)
+        demo_gradle_txt = verify('simpleDemo/build.gradle', demo_gradle, [
+            'compileSdkVersion %d' % TOOLCHAIN_16K['compile_sdk'],
+            # 改写会保留模板原有的引号（单双都可能），所以不能按字面子串校验
+            ('buildToolsVersion %s' % TOOLCHAIN_16K['build_tools'],
+             re.compile(r"buildToolsVersion\s+['\"]?%s['\"]?"
+                        % re.escape(TOOLCHAIN_16K['build_tools']))),
+        ])
 
         def _force_agp(content):
             # 兼容两种声明方式：classpath 'com.android.tools.build:gradle:x'
@@ -241,8 +261,14 @@ def build_project(zip_dir, params, log, cancel=None):
             return re.sub(r"(id\(['\"]com\.android\.application['\"]\s+version\s+['\"])[\d.]+(['\"])",
                           lambda m: m.group(1) + TOOLCHAIN_16K['agp'] + m.group(2), content)
         _sed_inplace(root_gradle, _force_agp)
-        ok('已强制 16K 工具链: compileSdk %d / buildTools %s / AGP %s'
-           % (TOOLCHAIN_16K['compile_sdk'], TOOLCHAIN_16K['build_tools'], TOOLCHAIN_16K['agp']))
+        # 两种声明方式都认不出来时 AGP 版本不会被改，16K 适配就此落空
+        verify('build.gradle', root_gradle,
+               [('AGP %s' % TOOLCHAIN_16K['agp'], TOOLCHAIN_16K['agp'])])
+        # 日志报回读到的真实值，而不是我们打算写入的值
+        ok('已强制 16K 工具链（已回读确认）: compileSdk %s / buildTools %s / AGP %s'
+           % (re.search(r'compileSdkVersion (\d+)', demo_gradle_txt).group(1),
+              re.search(r'buildToolsVersion ["\']([^"\']+)["\']', demo_gradle_txt).group(1),
+              TOOLCHAIN_16K['agp']))
 
     # 改写 wrapper 的 distributionUrl 为镜像内本地 zip 的 file:// 路径，
     # 构建/首次运行 gradlew 时直接使用本地文件，无需联网下载。
@@ -256,10 +282,14 @@ def build_project(zip_dir, params, log, cancel=None):
         gradle_zip = os.path.join(GRADLE_DIST_DIR, 'gradle-%s-bin.zip' % gradle_ver)
         if os.path.isfile(gradle_zip):
             # properties 文件里冒号按惯例转义（file\:///...），wrapper 读取后还原
+            local_url = 'distributionUrl=file\\:///' + gradle_zip.lstrip('/')
             _sed_inplace(wrapper_props, lambda c: re.sub(
                 r'distributionUrl=.*',
-                lambda m: 'distributionUrl=file\\:///' + gradle_zip.lstrip('/'),
+                lambda m: local_url,
                 c))
+            # 没改成 file:// 的话 Gradle 会在容器内联网下载发行版，离线环境必然失败
+            verify('gradle/wrapper/gradle-wrapper.properties', wrapper_props,
+                   [('distributionUrl 指向本地 %s' % os.path.basename(gradle_zip), local_url)])
             ok('gradle 发行版: %s（本地离线）' % gradle_ver)
         else:
             warn('未找到本地 Gradle 发行版 %s，保持模板 distributionUrl 联网下载' % gradle_zip)
@@ -368,23 +398,38 @@ def build_project(zip_dir, params, log, cancel=None):
 
     # 注意：替换内容必须由 lambda 返回。若直接把内容当替换字符串传给 re.sub，
     # 其中的 '\' 或 '\g' 会被正则引擎当转义序列处理（与下方 16K 工具链同一个坑）
-    _sed_inplace(os.path.join(data_dir, 'dcloud_control.xml'), lambda c: re.sub(
+    dcloud_control = os.path.join(data_dir, 'dcloud_control.xml')
+    _sed_inplace(dcloud_control, lambda c: re.sub(
         r'appid="[^"]*"', lambda m: 'appid="%s"' % _xml_escape(APPID),
         re.sub(r'appver="[^"]*"', lambda m: 'appver="%s"' % _xml_escape(VERSION_NAME), c)))
+    control_txt = verify('assets/data/dcloud_control.xml', dcloud_control, [
+        'appid="%s"' % _xml_escape(APPID),
+        'appver="%s"' % _xml_escape(VERSION_NAME),
+    ])
 
     # strings.xml 应用名（名称含 & < > 等字符时必须转义，否则 XML 解析失败）
     strings = os.path.join(res_dir, 'res', 'values', 'strings.xml')
     _sed_inplace(strings, lambda c: re.sub(
         r'<string name="app_name">[^<]*</string>',
         lambda m: '<string name="app_name">%s</string>' % _xml_escape(APP_NAME), c))
+    strings_txt = verify('res/values/strings.xml', strings, [
+        '<string name="app_name">%s</string>' % _xml_escape(APP_NAME),
+    ])
 
-    # styles.xml 注入 SplashTheme
+    # styles.xml 注入 SplashTheme（AndroidManifest 会引用它，缺了启动即崩）
     styles = os.path.join(res_dir, 'res', 'values', 'styles.xml')
     _sed_inplace(styles, lambda c: c if 'SplashTheme' in c else c.replace(
         '</resources>',
         '\n    <style name="SplashTheme" parent="DCloudActivityTheme">\n'
         '        <item name="android:windowBackground">@drawable/splash_bg</item>\n'
         '    </style>\n</resources>'))
+    verify('res/values/styles.xml', styles, ['SplashTheme'])
+
+    # 日志只报从文件里回读到的实际值，不报"我们打算写入什么"
+    ok('应用信息已写入: appid=%s appver=%s app_name=%s' % (
+        re.search(r'appid="([^"]*)"', control_txt).group(1),
+        re.search(r'appver="([^"]*)"', control_txt).group(1),
+        re.search(r'<string name="app_name">([^<]*)</string>', strings_txt).group(1)))
 
     # ---- 步骤 7：更新 build.gradle（包名/版本/ABI/依赖/签名）----
     log('步骤 7/9: 更新 build.gradle...')
@@ -436,7 +481,6 @@ def build_project(zip_dir, params, log, cancel=None):
                 '    lintOptions {\n        checkReleaseBuilds false\n        abortOnError false\n    }\n\naaptOptions {',
                 1)
         return content
-    _sed_inplace(bgrade, _edit_gradle)
 
     # 签名配置：证书已复制进工程，写入密码/别名
     shutil.copy2(app_keystore, simple_demo)
@@ -453,12 +497,40 @@ def build_project(zip_dir, params, log, cancel=None):
         content = re.sub(r"keyPassword '[^']*'",
                          lambda m: "keyPassword '%s'" % _gradle_sq(KEY_PASSWORD), content)
         return content
-    _sed_inplace(bgrade, _edit_sign)
+    # 合并成一次读-改-写：签名与依赖改写互不相干，没必要对同一文件读写两轮
+    _sed_inplace(bgrade, lambda c: _edit_sign(_edit_gradle(c)))
+
+    gradle_txt = verify('simpleDemo/build.gradle', bgrade, [
+        'applicationId "%s"' % _gradle_dq(APP_PACKAGE),
+        'minSdkVersion %d' % MIN_SDK,
+        'targetSdkVersion %d' % TARGET_SDK,
+        'versionCode %d' % int(VERSION_CODE),
+        'versionName "%s"' % _gradle_dq(VERSION_NAME),
+        'abiFilters',
+        'lintOptions',
+        'middleware',
+        'zip4j',
+        ('签名 storeFile', "storeFile file('%s')" % _gradle_sq(kname)),
+        ('签名 storePassword', "storePassword '%s'" % _gradle_sq(KEYSTORE_PASSWORD)),
+        ('签名 keyAlias', "keyAlias '%s'" % _gradle_sq(KEY_ALIAS)),
+        ('签名 keyPassword', "keyPassword '%s'" % _gradle_sq(KEY_PASSWORD)),
+    ] + (['useLegacyPackaging'] if TARGET_SDK >= 34 else []))
+
+    # 报回读到的真实值：模板锚点没命中的话上面已经中断了
+    ok('build.gradle 实际值: applicationId=%s versionCode=%s versionName=%s minSdk=%s targetSdk=%s'
+       % (re.search(r'applicationId "([^"]*)"', gradle_txt).group(1),
+          re.search(r'versionCode (\d+)', gradle_txt).group(1),
+          re.search(r'versionName "([^"]*)"', gradle_txt).group(1),
+          re.search(r'minSdkVersion (\d+)', gradle_txt).group(1),
+          re.search(r'targetSdkVersion (\d+)', gradle_txt).group(1)))
     ok('签名证书 -> ' + kname)
 
     # ---- 步骤 8：更新 AndroidManifest.xml（权限 / 启动主题 / AppKey）----
     log('步骤 8/9: 更新 AndroidManifest.xml...')
     amanifest = os.path.join(res_dir, 'AndroidManifest.xml')
+
+    # AppKey 中的 & / \ 在 XML 属性里需要转义（模板原有处理，保持原样）
+    appkey_esc = re.sub(r'([&/\\])', r'\\\1', DCLOUD_APPKEY)
 
     def _edit_manifest(content):
         if PERMS:
@@ -467,11 +539,22 @@ def build_project(zip_dir, params, log, cancel=None):
                 content = content[:idx] + '\n'.join(PERMS) + '\n\n' + content[idx:]
         content = content.replace('android:theme="@style/TranslucentTheme"',
                                   'android:theme="@style/SplashTheme"')
-        appkey = re.sub(r'([&/\\])', r'\\\1', DCLOUD_APPKEY)
         return re.sub(r'(android:name="dcloud_appkey"[^>]*android:value=")[^"]*(")',
-                      lambda mm: mm.group(1) + appkey + mm.group(2), content)
+                      lambda mm: mm.group(1) + appkey_esc + mm.group(2), content)
     _sed_inplace(amanifest, _edit_manifest)
-    ok('权限 %d 条，dcloud_appkey 已注入' % len(PERMS))
+
+    manifest_checks = [
+        ('启动主题 @style/SplashTheme', '@style/SplashTheme'),
+        # 只报"没注入"，不把 AppKey 本身写进日志
+        ('dcloud_appkey 未注入', 'android:value="%s"' % appkey_esc),
+    ]
+    # 权限逐条校验：<application> 锚点找不到时权限会被静默丢弃
+    manifest_checks += [('权限 #%d' % (i + 1), p) for i, p in enumerate(PERMS)]
+    manifest_txt = verify('src/main/AndroidManifest.xml', amanifest, manifest_checks)
+
+    # 报文件里的实际条数（模板自带若干权限，故可能多于本次注入的）
+    ok('AndroidManifest: 权限/特性 %d 条（本次注入 %d 条），dcloud_appkey 已注入'
+       % (len(re.findall(r'<uses-', manifest_txt)), len(PERMS)))
 
     # ---- 步骤 9：Gradle 编译 ----
     log('步骤 9/9: Gradle 编译...')

@@ -3,6 +3,7 @@
 
 import os
 import io
+import re
 import zipfile
 
 from .config import OUTPUT_DIR
@@ -51,6 +52,41 @@ def _sed_inplace(path, cb):
     if new_content != content:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(new_content)
+
+
+class TemplateMismatch(RuntimeError):
+    """SDK 模板结构与预期不符：锚点没命中，改写被静默跳过。"""
+
+
+def _verify(tag, path, checks):
+    """回读文件，确认期望内容确实写进去了，并返回文件内容。
+
+    模板改写全靠文本锚点匹配，锚点一旦没命中就静默跳过（_sed_inplace 只在
+    内容有变化时才写回，所以"没改成"和"已经是对的"表现完全一样）。后果是
+    包名/版本号不对、没签名、启动白屏，而日志照样显示成功，等装到设备上才
+    发现。所以这里一律硬失败：继续编出来也是坏包，早停比拿到坏包再排查便宜。
+
+    checks 是列表，元素三种写法：
+        '期望字符串'                   子串匹配，命中即通过
+        ('报错用的说明', '期望字符串')    同上，但报错只显示说明，
+                                      用于密码/AppKey 等敏感值
+        ('报错用的说明', re.compile(..)) 正则匹配：用于"值固定但写法可能不同"
+                                      的情况（例：buildToolsVersion 的引号
+                                      单双都可能，改写会保留原引号）
+    """
+    text = _read_text(path)
+    missing = []
+    for item in checks:
+        label, needle = item[:2] if isinstance(item, (tuple, list)) else (item, item)
+        if isinstance(needle, re.Pattern):
+            if not needle.search(text):
+                missing.append(label if isinstance(label, str) else needle.pattern)
+        elif needle not in text:
+            missing.append(label)
+    if missing:
+        raise TemplateMismatch('%s 模板校验失败，以下内容没写进去: %s'
+                               % (tag, '、'.join(missing)))
+    return text
 
 
 def extract_zip(data, dest):
