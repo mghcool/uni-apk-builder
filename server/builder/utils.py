@@ -55,16 +55,15 @@ def _sed_inplace(path, cb):
 
 def extract_zip(data, dest):
     """把 zip 字节流解压到 dest"""
-    zf = zipfile.ZipFile(io.BytesIO(data))
-    for name in zf.namelist():
-        name = name.replace('\\', '/')  # 统一路径分隔符
-        dest_path = os.path.abspath(os.path.join(dest, name))
-        if dest_path != dest and not dest_path.startswith(dest + os.sep):
-            raise RuntimeError('zip 含非法路径: ' + name)
-        if name.endswith('/'):
-            os.makedirs(dest_path, exist_ok=True)
-        else:
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            with open(dest_path, 'wb') as f:
-                f.write(zf.read(name))
-    zf.close()
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for name in zf.namelist():
+            name = name.replace('\\', '/')  # 统一路径分隔符
+            dest_path = os.path.abspath(os.path.join(dest, name))
+            if dest_path != dest and not dest_path.startswith(dest + os.sep):
+                raise RuntimeError('zip 含非法路径: ' + name)
+            if name.endswith('/'):
+                os.makedirs(dest_path, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                with open(dest_path, 'wb') as f:
+                    f.write(zf.read(name))

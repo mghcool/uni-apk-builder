@@ -17,13 +17,19 @@ import mimetypes
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote
 
-from .config import build_lock, WORK_DIR, WWWROOT
+from .config import build_lock, WWWROOT
 from .build import build_project
 from .utils import find_apk, extract_zip
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = 'uni-app-builder/py'
+
+    def setup(self):
+        super().setup()
+        # SSE 日志由主线程与心跳线程并发写入同一连接，必须串行化，
+        # 否则两次写入可能交错，产生损坏的事件
+        self._sse_lock = threading.Lock()
 
     def log_message(self, fmt, *args):
         pass  # 关闭默认访问日志（构建日志已单独输出）
@@ -38,15 +44,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _write_sse(self, line):
-        """写一行 SSE 事件并立即刷新"""
+        """写一行 SSE 事件并立即刷新（主线程与心跳线程并发调用安全）"""
         try:
-            self.wfile.write(('data: ' + line + '\n\n').encode('utf-8'))
-            self.wfile.flush()
+            with self._sse_lock:
+                self.wfile.write(('data: ' + line + '\n\n').encode('utf-8'))
+                self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass  # 客户端已断开，忽略
 
     def _read_body(self):
-        length = int(self.headers.get('Content-Length', 0) or 0)
+        try:
+            length = int(self.headers.get('Content-Length', 0) or 0)
+        except ValueError:            # Content-Length 非法，按空请求体处理
+            return b''
         data = b''
         while len(data) < length:
             chunk = self.rfile.read(length - len(data))
@@ -146,12 +156,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(409, {'error': '已有构建正在执行，请等待当前构建结束后再试'})
             return
 
+        # 锁必须持有到本次响应彻底结束：send_response / 启动心跳线程同样可能
+        # 因客户端断开而抛异常，若把 release 交给内层 try/finally，异常路径下
+        # 锁会永久泄漏，后续所有构建请求都会收到 409
+        try:
+            self._stream_build(tmp_dir, params)
+        except Exception as e:
+            print('[ERROR] SSE 输出中断: %s' % e, flush=True)
+        finally:
+            build_lock.release()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _stream_build(self, tmp_dir, params):
+        """以 SSE 逐行输出一次构建日志（调用方保证已持有 build_lock）"""
         # SSE 响应头。无 Content-Length，客户端靠连接关闭(EOF)判断流结束，
         # 因此响应结束后必须关闭连接
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('X-Accel-Buffering', 'no')
+        self.send_header('Connection', 'close')
         self.end_headers()
         self.close_connection = True
 
@@ -178,8 +202,6 @@ class Handler(BaseHTTPRequestHandler):
             log('=== 构建结束 (exit=1) ===')
         finally:
             heartbeat_stop.set()
-            build_lock.release()
-            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ---- 下载接口 ----
     def _download(self):

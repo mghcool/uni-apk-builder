@@ -22,6 +22,30 @@ from .config import (WORK_DIR, ANDROID_SDK_DIR, OUTPUT_DIR, GRADLE_USER_HOME,
 from .utils import _human_size, _read_text, _sed_inplace, find_android_home
 
 
+def _xml_escape(s):
+    """转义 XML 文本/属性中的特殊字符（应用名、版本号来自用户 manifest.json）"""
+    return (str(s).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;'))
+
+
+def _gradle_sq(s):
+    """转义 Gradle 单引号字符串中的反斜杠与单引号"""
+    return str(s).replace('\\', '\\\\').replace("'", "\\'")
+
+
+def _gradle_dq(s):
+    """转义 Gradle 双引号字符串中的反斜杠与双引号"""
+    return str(s).replace('\\', '\\\\').replace('"', '\\"')
+
+
+def _as_int(v, default):
+    """把 manifest 里的数值字段安全转成 int，非法时回退默认值"""
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def build_project(zip_dir, params, log):
     """执行一次完整构建。构建失败的现场保留在 WORK_DIR 便于排查。"""
 
@@ -88,17 +112,27 @@ def build_project(zip_dir, params, log):
         raise
     APPID = m.get('id', '')
     APP_NAME = m.get('name', '')
-    VERSION_NAME = m.get('version', {}).get('name', '')
-    VERSION_CODE = m.get('version', {}).get('code', '')
-    plus = m.get('plus', {})
-    google = plus.get('distribute', {}).get('google', {})
-    MIN_SDK = google.get('minSdkVersion', 21)
-    TARGET_SDK = google.get('targetSdkVersion', 30)
-    PERMS = google.get('permissions', []) or []
-    COMPILER_VER = plus.get('uni-app', {}).get('compilerVersion', '')
+    version = m.get('version') or {}            # manifest 里可能显式写 null
+    VERSION_NAME = version.get('name', '')
+    VERSION_CODE = version.get('code', '')
+    plus = m.get('plus') or {}
+    google = (plus.get('distribute') or {}).get('google') or {}
+    MIN_SDK = _as_int(google.get('minSdkVersion'), 21)
+    TARGET_SDK = _as_int(google.get('targetSdkVersion'), 30)
+    PERMS = [p for p in (google.get('permissions') or [])
+             if isinstance(p, str) and p.strip()]
+    COMPILER_VER = (plus.get('uni-app') or {}).get('compilerVersion', '')
     if not COMPILER_VER:
         err('manifest.json 缺少 plus.uni-app.compilerVersion，无法确定 SDK 版本')
         raise RuntimeError('缺少 compilerVersion')
+    if not APPID:
+        # 缺失时资源会被塞进 assets/apps//www，编译能过但运行必白屏
+        err('manifest.json 缺少 id（uni-app AppID），无法确定资源目录')
+        raise RuntimeError('缺少 AppID')
+    if not str(VERSION_CODE).strip().isdigit():
+        # 直接写入会得到 "versionCode "（无值），Gradle 报语法错误且难以定位
+        err('manifest.json 的 version.code 缺失或非整数（当前: %r）' % VERSION_CODE)
+        raise RuntimeError('version.code 非法')
     log('  AppID: %s  应用名: %s  版本: %s(%s)' % (APPID, APP_NAME, VERSION_NAME, VERSION_CODE))
 
     # ---- 步骤 2：按 compilerVersion 匹配离线打包 SDK ----
@@ -299,15 +333,17 @@ def build_project(zip_dir, params, log):
         shutil.copy2(os.path.join(sdk_data, 'dcloud_error.html'), data_dir)
     shutil.copy2(os.path.join(sdk_data, 'dcloud_control.xml'), data_dir)
 
+    # 注意：替换内容必须由 lambda 返回。若直接把内容当替换字符串传给 re.sub，
+    # 其中的 '\' 或 '\g' 会被正则引擎当转义序列处理（与下方 16K 工具链同一个坑）
     _sed_inplace(os.path.join(data_dir, 'dcloud_control.xml'), lambda c: re.sub(
-        r'appid="[^"]*"', 'appid="%s"' % APPID,
-        re.sub(r'appver="[^"]*"', 'appver="%s"' % VERSION_NAME, c)))
+        r'appid="[^"]*"', lambda m: 'appid="%s"' % _xml_escape(APPID),
+        re.sub(r'appver="[^"]*"', lambda m: 'appver="%s"' % _xml_escape(VERSION_NAME), c)))
 
-    # strings.xml 应用名
+    # strings.xml 应用名（名称含 & < > 等字符时必须转义，否则 XML 解析失败）
     strings = os.path.join(res_dir, 'res', 'values', 'strings.xml')
     _sed_inplace(strings, lambda c: re.sub(
         r'<string name="app_name">[^<]*</string>',
-        '<string name="app_name">%s</string>' % APP_NAME, c))
+        lambda m: '<string name="app_name">%s</string>' % _xml_escape(APP_NAME), c))
 
     # styles.xml 注入 SplashTheme
     styles = os.path.join(res_dir, 'res', 'values', 'styles.xml')
@@ -322,11 +358,13 @@ def build_project(zip_dir, params, log):
     bgrade = os.path.join(simple_demo, 'build.gradle')
 
     def _edit_gradle(content):
-        content = re.sub(r'applicationId "[^"]*"', 'applicationId "%s"' % APP_PACKAGE, content)
-        content = re.sub(r'minSdkVersion \d+', 'minSdkVersion %s' % MIN_SDK, content)
-        content = re.sub(r'targetSdkVersion \d+', 'targetSdkVersion %s' % TARGET_SDK, content)
-        content = re.sub(r'versionCode \d+', 'versionCode %s' % VERSION_CODE, content)
-        content = re.sub(r'versionName "[^"]*"', 'versionName "%s"' % VERSION_NAME, content)
+        content = re.sub(r'applicationId "[^"]*"',
+                         lambda m: 'applicationId "%s"' % _gradle_dq(APP_PACKAGE), content)
+        content = re.sub(r'minSdkVersion \d+', 'minSdkVersion %d' % MIN_SDK, content)
+        content = re.sub(r'targetSdkVersion \d+', 'targetSdkVersion %d' % TARGET_SDK, content)
+        content = re.sub(r'versionCode \d+', 'versionCode %d' % int(VERSION_CODE), content)
+        content = re.sub(r'versionName "[^"]*"',
+                         lambda m: 'versionName "%s"' % _gradle_dq(VERSION_NAME), content)
         if 'abiFilters' not in content:
             content = content.replace(
                 'multiDexEnabled true',
@@ -354,7 +392,7 @@ def build_project(zip_dir, params, log):
                     break
             content = '\n'.join(lines)
         content = content.replace('androidx.core:core:1.1.0', 'androidx.core:core:1.6.0')
-        if int(str(TARGET_SDK)) >= 34 and 'useLegacyPackaging' not in content:
+        if TARGET_SDK >= 34 and 'useLegacyPackaging' not in content:
             content = content.replace(
                 'aaptOptions {',
                 '    packagingOptions {\n        jniLibs {\n            useLegacyPackaging true\n        }\n    }\n\naaptOptions {',
@@ -372,10 +410,15 @@ def build_project(zip_dir, params, log):
     kname = os.path.basename(app_keystore)
 
     def _edit_sign(content):
-        content = re.sub(r"storeFile file\('[^']*'\)", "storeFile file('%s')" % kname, content)
-        content = re.sub(r"storePassword '[^']*'", "storePassword '%s'" % KEYSTORE_PASSWORD, content)
-        content = re.sub(r"keyAlias '[^']*'", "keyAlias '%s'" % KEY_ALIAS, content)
-        content = re.sub(r"keyPassword '[^']*'", "keyPassword '%s'" % KEY_PASSWORD, content)
+        # 证书密码/别名来自接口参数，若含 '\' 或 ' 会破坏 Gradle 语法，需先转义
+        content = re.sub(r"storeFile file\('[^']*'\)",
+                         lambda m: "storeFile file('%s')" % _gradle_sq(kname), content)
+        content = re.sub(r"storePassword '[^']*'",
+                         lambda m: "storePassword '%s'" % _gradle_sq(KEYSTORE_PASSWORD), content)
+        content = re.sub(r"keyAlias '[^']*'",
+                         lambda m: "keyAlias '%s'" % _gradle_sq(KEY_ALIAS), content)
+        content = re.sub(r"keyPassword '[^']*'",
+                         lambda m: "keyPassword '%s'" % _gradle_sq(KEY_PASSWORD), content)
         return content
     _sed_inplace(bgrade, _edit_sign)
     ok('签名证书 -> ' + kname)
@@ -400,8 +443,11 @@ def build_project(zip_dir, params, log):
     # ---- 步骤 9：Gradle 编译 ----
     log('步骤 9/9: Gradle 编译...')
     android_home = find_android_home() or '/opt/android-sdk'
-    m_cs = re.search(r'compileSdkVersion\s+(\d+)', _read_text(bgrade))
-    m_bt = re.search(r'buildToolsVersion\s+"([^"]+)"', _read_text(bgrade))
+    # buildToolsVersion 的引号单双都可能（SDK 5.x 模板用单引号），两种都要能识别，
+    # 否则取不到版本号，就不会去补装对应的 build-tools
+    bgrade_text = _read_text(bgrade)
+    m_cs = re.search(r'compileSdkVersion\s+(\d+)', bgrade_text)
+    m_bt = re.search(r'buildToolsVersion\s+["\']([^"\']+)["\']', bgrade_text)
     compile_sdk = m_cs.group(1) if m_cs else None
     build_tools = m_bt.group(1) if m_bt else None
 
