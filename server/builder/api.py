@@ -52,11 +52,15 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # 客户端已断开，忽略
 
-    def _read_body(self):
+    def _content_length(self):
+        """解析 Content-Length；缺失或非法按 0 处理"""
         try:
-            length = int(self.headers.get('Content-Length', 0) or 0)
-        except ValueError:            # Content-Length 非法，按空请求体处理
-            return b''
+            return int(self.headers.get('Content-Length', 0) or 0)
+        except ValueError:
+            return 0
+
+    def _read_body(self):
+        length = self._content_length()
         data = b''
         while len(data) < length:
             chunk = self.rfile.read(length - len(data))
@@ -64,6 +68,19 @@ class Handler(BaseHTTPRequestHandler):
                 break
             data += chunk
         return data
+
+    def _discard_body(self):
+        """读完请求体并丢弃（分块读，不占内存）
+
+        拒绝请求时必须先把 body 读完再回响应：若服务端提前响应并关闭连接，
+        客户端还在写 body 时会收到 RST，表现为"连接错误"而非我们回的 409
+        """
+        remaining = self._content_length()
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
 
     # ---- 静态页面 ----
     def _serve_index(self):
@@ -135,37 +152,38 @@ class Handler(BaseHTTPRequestHandler):
             'appkey': q('appkey'),
         }
 
-        # 读取 zip 请求体
-        data = self._read_body()
-        if not data:
-            self._send_json(400, {'error': '请求体为空，请上传 zip 压缩包'})
-            return
-        # 上传临时目录放在系统临时目录，与构建工作目录分开，
-        # 避免 build_project 开头清空 WORK_DIR 时把上传内容一起删掉
-        tmp_dir = tempfile.mkdtemp(prefix='upload_')
-        try:
-            extract_zip(data, tmp_dir)
-        except Exception as e:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            self._send_json(400, {'error': '解压失败: ' + str(e)})
-            return
-
-        # 并发控制：已有构建在跑则直接拒绝
+        # 并发控制放在读取请求体之前：并发时不必先把几十 MB 的 zip 收下来
+        # 再解压到磁盘，抢不到锁直接把请求体读完丢弃（必须先读完再回，
+        # 理由见 _discard_body）
         if not build_lock.acquire(blocking=False):
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._discard_body()
             self._send_json(409, {'error': '已有构建正在执行，请等待当前构建结束后再试'})
             return
 
-        # 锁必须持有到本次响应彻底结束：send_response / 启动心跳线程同样可能
-        # 因客户端断开而抛异常，若把 release 交给内层 try/finally，异常路径下
-        # 锁会永久泄漏，后续所有构建请求都会收到 409
+        # 抢到锁之后，任何异常/提前返回路径都必须释放锁并清理上传目录
+        tmp_dir = None
         try:
+            # 读取 zip 请求体
+            data = self._read_body()
+            if not data:
+                self._send_json(400, {'error': '请求体为空，请上传 zip 压缩包'})
+                return
+            # 上传临时目录放在系统临时目录，与构建工作目录分开，
+            # 避免 build_project 开头清空 WORK_DIR 时把上传内容一起删掉
+            tmp_dir = tempfile.mkdtemp(prefix='upload_')
+            try:
+                extract_zip(data, tmp_dir)
+            except Exception as e:
+                self._send_json(400, {'error': '解压失败: ' + str(e)})
+                return
+
             self._stream_build(tmp_dir, params)
         except Exception as e:
-            print('[ERROR] SSE 输出中断: %s' % e, flush=True)
+            print('[ERROR] 构建请求处理异常: %s' % e, flush=True)
         finally:
             build_lock.release()
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _stream_build(self, tmp_dir, params):
         """以 SSE 逐行输出一次构建日志（调用方保证已持有 build_lock）"""
