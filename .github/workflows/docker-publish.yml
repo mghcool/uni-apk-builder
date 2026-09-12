@@ -85,7 +85,6 @@ jobs:
             ${{ env.DH_IMAGE }}
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
             type=raw,value=test,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - uses: docker/build-push-action@v6
@@ -105,3 +104,12 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: 清理 GHCR 上无 tag 的旧版本
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: uni-apk-builder
+          package-type: container
+          delete-only-untagged-versions: true   # 只删丢掉 tag 的旧 digest，不动 latest/1.1.0/test/buildcache
+          min-versions-to-keep: 1               # 至少保留最新 1 个版本
+          token: ${{ secrets.GITHUB_TOKEN }}
