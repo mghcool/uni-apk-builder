@@ -12,8 +12,9 @@ uni-app Android 离线打包服务 —— 入口文件（启动 HTTP 服务）
             /app            uni-app 前端构建产物（应用名/AppID/版本/权限等元数据从其中的 manifest.json 读取）
             /icons          应用图标，命名 <宽>x<高>.png（36/48/72/96/144/192）
             /app.keystore   签名证书（别名密码自动使用证书密码）
-        响应：text/event-stream，逐行输出构建日志，
-            以 "=== 构建结束 (exit=0)" 或 "=== 构建结束 (exit=1)" 行收尾
+        响应：text/event-stream，逐行输出构建日志；
+            结束时不再发日志行，而是发一个具名事件 event: end，
+            data 为 "exit=0"（成功）或 "exit=1"（失败），客户端据此收尾
         并发：同一时刻仅允许一个构建，占用中返回 HTTP 409
     GET /api/download       下载最新一次构建成功产出的 APK（服务端只保留最新一个）
     GET /                   静态说明页（wwwroot/ 目录）

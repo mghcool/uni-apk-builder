@@ -6,6 +6,7 @@
     GET  /               静态说明页（wwwroot/index.html，未命中路径 SPA fallback）
     GET  /api/download   下载最新一次构建成功产出的 APK
     POST /api/build      上传 zip 触发构建，SSE 输出日志；占用中返回 409
+                         结束时发具名事件 event: end，data 为 exit=0/exit=1
 """
 
 import os
@@ -59,6 +60,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         except OSError:
             # 含 BrokenPipeError / ConnectionResetError / ConnectionAbortedError
+            self._client_gone = True
+
+    def _write_sse_event(self, event, data=''):
+        """写一个具名 SSE 事件（如 event: end）并立即刷新
+
+        与 _write_sse 的区别在于 event 字段有名字：客户端按事件名识别信令，
+        不必把它当日志行显示，也不用靠文本前缀去猜。"构建结束/成败"属于协议
+        信令而非构建日志，混在日志流里会和 build.py 的"构建成功"重复
+        """
+        if self._client_gone:
+            return
+        try:
+            with self._sse_lock:
+                self.wfile.write(('event: %s\ndata: %s\n\n' % (event, data)).encode('utf-8'))
+                self.wfile.flush()
+        except OSError:
             self._client_gone = True
 
     def _content_length(self):
@@ -242,13 +259,15 @@ class Handler(BaseHTTPRequestHandler):
         log('[开始] 构建已启动...')
         try:
             build_project(tmp_dir, params, log, cancel)
-            log('=== 构建结束 (exit=0) ===')
+            # 结束用具名事件通知，不再发一行 "构建结束" 日志：
+            # 成功与否已由日志里的"构建成功"/"构建异常"说明，这行纯属重复
+            self._write_sse_event('end', 'exit=0')
         except BuildCancelled as e:
             # 客户端已断开，再发 SSE 没有意义，只留一行控制台日志
             print('[INFO] 构建已中止: %s' % e, flush=True)
         except Exception as e:
             log('构建异常: ' + str(e))
-            log('=== 构建结束 (exit=1) ===')
+            self._write_sse_event('end', 'exit=1')
         finally:
             heartbeat_stop.set()
 

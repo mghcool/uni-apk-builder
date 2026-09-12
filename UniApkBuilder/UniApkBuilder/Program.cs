@@ -105,11 +105,16 @@ namespace UniApkBuilder
                 zip.CreateEntryFromFile(KeystorePath, "app.keystore", CompressionLevel.Optimal);
             }
 
-            RemoteBuild(config, zipPath, outputPath).GetAwaiter().GetResult();
+            bool? buildResult = RemoteBuild(config, zipPath, outputPath).GetAwaiter().GetResult();
 
             File.Delete(zipPath);
 
             WaitExit(shouldWait);
+
+            // null：HTTP 层就没进去；false：进入了构建流但没成功（原因已在上面打印）。
+            // 两种情况都必须以非零码退出，否则批处理 / CI 会把失败的构建当成成功
+            if (buildResult is null) return -5;
+            if (buildResult is false) return -6;
             return 0;
         }
 
@@ -241,7 +246,11 @@ namespace UniApkBuilder
             }
         }
 
-        static async Task RemoteBuild(ApkConfig cfg, string filePath, string outputPath)
+        /// <summary>上传 zip 触发远端构建，实时输出日志，成功后下载 APK</summary>
+        /// <returns>true：构建成功且 APK 下载完成；
+        ///          false：进入了日志流但未成功（构建失败 / 流在结束事件前中断 / 下载失败，原因已打印）；
+        ///          null：没进入日志流（HTTP 层就失败了，如 400/409/413）</returns>
+        static async Task<bool?> RemoteBuild(ApkConfig cfg, string filePath, string outputPath)
         {
             string baseUrl = cfg.HostUrl.TrimEnd('/');
 
@@ -271,36 +280,46 @@ namespace UniApkBuilder
                 // 400/500：服务端此时返回的是 JSON {"error": "..."}，还没进入 SSE 流
                 var err = await resp.Content.ReadAsStringAsync();
                 Console.WriteLine($"[HTTP {(int)resp.StatusCode}] {err}");
-                return;
+                return null;
             }
 
             // ---- 2) 用 SseParser 逐条读取构建日志 ----
             await using var stream = await resp.Content.ReadAsStreamAsync();
             var parser = SseParser.Create(stream);
-            var success = false;
+            var sawEnd = false;      // 是否收到 event: end 结束事件
+            var success = false;     // 该结束事件是否表示构建成功
 
             await foreach (var item in parser.EnumerateAsync())
             {
                 var line = item.Data ?? string.Empty;
-                if (line.Length == 0) continue;            // 服务端每 30 秒发一次心跳空行，跳过
-                Console.WriteLine(line);                       // 打到控制台 / UI / 日志文件
 
-                if (line.StartsWith("=== 构建结束"))
+                // 构建结束由服务端发具名事件（event: end）
+                if (item.EventType == "end")
                 {
+                    sawEnd = true;
                     success = line.Contains("exit=0");     // exit=1 表示构建失败
-                    break;                                 // 收到结束标记立即退出，不依赖连接 EOF
+                    break;                                 // 收到结束事件立即退出，不依赖连接 EOF
                 }
+
+                if (line.Length == 0) continue;            // 服务端每 30 秒发一次心跳空行，跳过
+                Console.WriteLine(line);                   // 打到控制台 / UI / 日志文件
             }
 
-            if (!success) return;
+            // 流在收到结束事件之前就结束了（服务端崩溃 / 被重启 / 网络中断），显式报错
+            if (!sawEnd)
+            {
+                ConsoleErrorWriteLine("构建流意外中断：未收到服务端结束事件，无法确认构建结果");
+                return false;
+            }
 
-            // ---- 3) 下载最新 APK（从 Content-Disposition 读取服务端原始文件名）----
-            Console.WriteLine("开始下载Apk...");
-            await DownloadApkAsync(http, baseUrl, outputPath);
+            if (!success) return false;   // 收到结束事件但退出码非 0，失败原因已在日志里
+
+            // ---- 3) 下载最新 APK ----
+            if (!await DownloadApkAsync(http, baseUrl, outputPath)) return false;
+            return true;
         }
 
         /// <summary>下载服务端最新 APK 到 outputPath，并实时输出下载进度</summary>
-        /// <returns>下载并保存成功返回 true</returns>
         static async Task<bool> DownloadApkAsync(HttpClient http, string baseUrl, string outputPath)
         {
             // 必须用 ResponseHeadersRead：否则 HttpClient 会把整个 APK 缓冲完才返回，
@@ -341,13 +360,13 @@ namespace UniApkBuilder
                     int percent = (int)(received * 100 / total.Value);
                     if (percent == lastPercent) return;
                     lastPercent = percent;
-                    text = $"下载中 {percent,3}% ({received / 1024.0 / 1024:F1}/{total.Value / 1024.0 / 1024:F1} MB)";
+                    text = $"下载APK {percent,3}% ({received / 1024.0 / 1024:F1}/{total.Value / 1024.0 / 1024:F1} MB)";
                 }
                 else
                 {
                     if (received - lastReportedBytes < 1024 * 1024) return;   // 长度未知时每满 1MB 报一次
                     lastReportedBytes = received;
-                    text = $"下载中 {received / 1024.0 / 1024:F1} MB";
+                    text = $"下载APK {received / 1024.0 / 1024:F1} MB";
                 }
 
                 if (!inPlace)
@@ -366,6 +385,7 @@ namespace UniApkBuilder
 
             byte[] buffer = new byte[81920];
             int read;
+            ReportProgress(); // 接收前先显示一下正在接收，不然网络不好不知道在干嘛
             while ((read = await source.ReadAsync(buffer)) > 0)
             {
                 await target.WriteAsync(buffer.AsMemory(0, read));
